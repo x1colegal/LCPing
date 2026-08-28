@@ -49,7 +49,7 @@ The script reads the active PPPoE session from:
 
 Copy `lcpping.uc` to the OpenWrt router:
 
-    scp -O lcpping.uc root@[ROUTER_IPV6]:/root/lcpping.uc
+    scp -O lcpping.uc root@[ROUTER_IP]:/root/lcpping.uc
 
 Then make it executable:
 
