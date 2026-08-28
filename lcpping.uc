@@ -15,6 +15,7 @@ import { pack, unpack } from 'struct';
  * Options:
  *   -c COUNT       stop after COUNT requests
  *   -i INTERVAL    interval in seconds (default: 1)
+  -if INTERVAL   flood mode; send without waiting for replies
  *   -W TIMEOUT     reply timeout in seconds (default: 3)
  *   -q             quiet
  *   -h             help
@@ -132,6 +133,7 @@ b[3], b[4], b[5]
 
 let count = 0;
 let interval = DEFAULT_INTERVAL;
+let flood_interval = null;
 let timeout = DEFAULT_TIMEOUT;
 let quiet = false;
 
@@ -142,6 +144,7 @@ print(
 Options:
   -c COUNT       stop after COUNT requests
   -i INTERVAL    seconds between requests (default: 1)
+  -if INTERVAL   flood mode; send without waiting for replies
   -W TIMEOUT     reply timeout in seconds (default: 3)
   -q             quiet
   -h             help
@@ -170,6 +173,19 @@ count = int(ARGV[i]);
 if (count <= 0)
 die('invalid count');
 }
+else if (arg == '-if') {
+        if (++i >= length(ARGV))
+                die('-if requires an argument');
+
+        flood_interval = +ARGV[i];
+
+        if (!(flood_interval > 0))
+                die('invalid flood interval');
+
+        if (flood_interval < 0.0007)
+                die('-if minimum interval is 0.0007 seconds');
+}
+
 else if (arg == '-i') {
 if (++i >= length(ARGV))
 die('-i requires an argument');
@@ -524,6 +540,8 @@ let rtt_max = null;
 let rtt_sum = 0.0;
 let rtt_sum_sq = 0.0;
 
+let run_started = null;
+
 let running = true;
 let stop_requested = false;
 let in_flight = false;
@@ -556,6 +574,18 @@ transmitted,
 received,
 loss
 );
+
+        if (run_started != null) {
+                let elapsed =
+                        ns_to_ms(
+                                now_ns() - run_started
+                        ) / 1000.0;
+
+                printf(
+                        'time = %.3f s\n',
+                        elapsed
+                );
+        }
 
 if (received > 0) {
 let avg = rtt_sum / received;
@@ -724,121 +754,476 @@ local_magic
  * ------------------------------------------------------------
  */
 
+run_started = now_ns();
+
 let sequence = 1;
 
-while (running) {
-if (count > 0 && transmitted >= count)
-break;
 
-        let identifier = ((sequence - 1) % 255) + 1;
+/*
+ * ------------------------------------------------------------
+ * Sequential mode (-i)
+ * ------------------------------------------------------------
+ */
 
+if (flood_interval == null) {
+        while (running) {
+                if (count > 0 && transmitted >= count)
+                        break;
 
-let started = now_ns();
+                let identifier =
+                        ((sequence - 1) % 255) + 1;
 
-let bytes = send_echo(identifier);
+                let started = now_ns();
 
-transmitted++;
-        in_flight = true;
+                let bytes =
+                        send_echo(identifier);
 
-let reply = wait_reply(
-identifier,
-sec_to_ns(timeout)
-);
-in_flight = false;
+                transmitted++;
+                in_flight = true;
 
-if (!running)
-break;
+                let reply = wait_reply(
+                        identifier,
+                        sec_to_ns(timeout)
+                );
 
-if (reply) {
-let rtt =
-ns_to_ms(
-now_ns() - started
-);
+                in_flight = false;
 
-received++;
+                if (!running)
+                        break;
 
-rtt_sum += rtt;
-rtt_sum_sq += rtt * rtt;
+                if (reply) {
+                        let rtt =
+                                ns_to_ms(
+                                        now_ns() - started
+                                );
 
-if (rtt_min == null || rtt < rtt_min)
-rtt_min = rtt;
+                        received++;
 
-if (rtt_max == null || rtt > rtt_max)
-rtt_max = rtt;
+                        rtt_sum += rtt;
+                        rtt_sum_sq += rtt * rtt;
 
-if (!quiet) {
-printf(
-'%d bytes from %s: lcp_seq=%d id=%d magic=0x%08x time=%.3f ms\n',
-bytes,
-pppoe.peer_mac,
-sequence,
-identifier,
-reply.magic,
-rtt
-);
+                        if (rtt_min == null ||
+                            rtt < rtt_min)
+                                rtt_min = rtt;
+
+                        if (rtt_max == null ||
+                            rtt > rtt_max)
+                                rtt_max = rtt;
+
+                        if (!quiet) {
+                                printf(
+                                        '%d bytes from %s: lcp_seq=%d id=%d magic=0x%08x time=%.3f ms\n',
+                                        bytes,
+                                        pppoe.peer_mac,
+                                        sequence,
+                                        identifier,
+                                        reply.magic,
+                                        rtt
+                                );
+                        }
+                }
+                else {
+                        if (!quiet) {
+                                printf(
+                                        'Request timeout for lcp_seq %d\n',
+                                        sequence
+                                );
+                        }
+                }
+
+                if (stop_requested) {
+                        running = false;
+                        break;
+                }
+
+                sequence++;
+
+                if (!running)
+                        break;
+
+                if (count > 0 &&
+                    transmitted >= count)
+                        break;
+
+                let next_send =
+                        started +
+                        sec_to_ns(interval);
+
+                while (
+                        running &&
+                        now_ns() < next_send
+                ) {
+                        let remaining =
+                                int(
+                                        (next_send -
+                                         now_ns()) /
+                                        1000000
+                                );
+
+                        if (remaining < 1)
+                                remaining = 1;
+
+                        let events =
+                                socket.poll(
+                                        remaining,
+                                        sock
+                                );
+
+                        if (!running)
+                                break;
+
+                        if (events != null) {
+                                sock.recv(
+                                        2048,
+                                        socket.MSG_DONTWAIT
+                                );
+                        }
+                }
+        }
 }
-}
+
+
+/*
+ * ------------------------------------------------------------
+ * Flood mode (-if)
+ *
+ * Requests are transmitted according to their own clock.
+ * Replies are processed independently.
+ *
+ * An Identifier is never reused while a request using that
+ * Identifier is still outstanding.
+ *
+ * Since the LCP Identifier is one octet, at most 255 requests
+ * may be outstanding simultaneously.
+ * ------------------------------------------------------------
+ */
+
 else {
-if (!quiet)
-printf(
-'Request timeout for lcp_seq %d\n',
-sequence
-);
-}
+        let pending = [];
+        let pending_count = 0;
 
-        if (stop_requested) {
-                running = false;
-                break;
+        let flood_ns =
+                sec_to_ns(flood_interval);
+
+        let timeout_ns =
+                sec_to_ns(timeout);
+
+        let next_send =
+                now_ns();
+
+
+        /*
+         * Find an unused LCP Identifier.
+         */
+
+        function get_free_identifier() {
+                let preferred =
+                        ((sequence - 1) % 255) + 1;
+
+                for (let offset = 0;
+                     offset < 255;
+                     offset++) {
+
+                        let id =
+                                ((preferred - 1 + offset) %
+                                 255) + 1;
+
+                        if (pending[id] == null)
+                                return id;
+                }
+
+                return null;
         }
 
-sequence++;
 
-if (!running)
-break;
+        /*
+         * Drain every currently queued Echo-Reply.
+         */
 
-if (count > 0 && transmitted >= count)
-break;
+        function receive_flood_replies() {
+                while (true) {
+                        let pkt =
+                                sock.recv(
+                                        2048,
+                                        socket.MSG_DONTWAIT
+                                );
 
-/*
- * Keep interval relative to transmission time,
- * like ping rather than sleeping an additional
- * full interval after receiving the reply.
- */
+                        if (pkt == null)
+                                break;
 
-let next_send =
-started +
-sec_to_ns(interval);
+                        let p =
+                                parse_lcp(
+                                        pkt,
+                                        pppoe
+                                );
 
-while (
-running &&
-now_ns() < next_send
-) {
-let remaining =
-int(
-(next_send - now_ns()) /
-1000000
-);
+                        if (!p)
+                                continue;
 
-if (remaining < 1)
-remaining = 1;
+                        if (p.code !=
+                            LCP_ECHO_REPLY)
+                                continue;
 
-let events = socket.poll(
-remaining,
-sock
-);
+                        if (p.src !=
+                            pppoe.peer_mac)
+                                continue;
 
-if (!running)
-break;
+                        if (p.dst !=
+                            pppoe.local_mac)
+                                continue;
 
-/*
- * Drain unrelated PPPoE LCP traffic.
- */
-if (events != null)
-sock.recv(
-2048,
-socket.MSG_DONTWAIT
-);
-}
+                        let req =
+                                pending[p.id];
+
+                        if (req == null)
+                                continue;
+
+                        let rtt =
+                                ns_to_ms(
+                                        now_ns() -
+                                        req.sent
+                                );
+
+                        received++;
+
+                        rtt_sum += rtt;
+                        rtt_sum_sq += rtt * rtt;
+
+                        if (rtt_min == null ||
+                            rtt < rtt_min)
+                                rtt_min = rtt;
+
+                        if (rtt_max == null ||
+                            rtt > rtt_max)
+                                rtt_max = rtt;
+
+                        if (!quiet) {
+                                printf(
+                                        '%d bytes from %s: lcp_seq=%d id=%d magic=0x%08x time=%.3f ms\n',
+                                        req.bytes,
+                                        pppoe.peer_mac,
+                                        req.seq,
+                                        p.id,
+                                        p.magic,
+                                        rtt
+                                );
+                        }
+
+                        pending[p.id] = null;
+                        pending_count--;
+
+                        in_flight =
+                                pending_count > 0;
+                }
+        }
+
+
+        /*
+         * Expire requests that exceeded -W.
+         */
+
+        function expire_flood_requests() {
+                let now = now_ns();
+
+                for (let id = 1;
+                     id <= 255;
+                     id++) {
+
+                        let req =
+                                pending[id];
+
+                        if (req == null)
+                                continue;
+
+                        if ((now - req.sent) <
+                            timeout_ns)
+                                continue;
+
+                        if (!quiet && !stop_requested) {
+                                printf(
+                                        'Request timeout for lcp_seq %d\n',
+                                        req.seq
+                                );
+                        }
+
+                        pending[id] = null;
+                        pending_count--;
+                }
+
+                in_flight =
+                        pending_count > 0;
+        }
+
+
+        /*
+         * Main flood event loop.
+         */
+
+        while (running ||
+               pending_count > 0) {
+
+                /*
+                 * Ctrl+C:
+                 *
+                 * stop transmitting immediately,
+                 * then drain existing requests.
+                 */
+
+                if (stop_requested)
+                        running = false;
+
+
+                /*
+                 * Receive before transmitting more.
+                 */
+
+                receive_flood_replies();
+                expire_flood_requests();
+
+
+                /*
+                 * -c stops new transmissions but existing
+                 * requests are still drained.
+                 */
+
+                if (count > 0 &&
+                    transmitted >= count)
+                        running = false;
+
+
+                /*
+                 * Send every request currently due.
+                 *
+                 * If the clock has advanced past multiple
+                 * intervals, this loop catches up until either
+                 * the schedule is current or all 255 IDs are
+                 * occupied.
+                 */
+
+                let now = now_ns();
+
+                while (
+                        running &&
+                        now >= next_send &&
+                        pending_count < 255 &&
+                        (count == 0 ||
+                         transmitted < count)
+                ) {
+                        let identifier =
+                                get_free_identifier();
+
+                        if (identifier == null)
+                                break;
+
+                        let sent =
+                                now_ns();
+
+                        let bytes =
+                                send_echo(identifier);
+
+                        pending[identifier] = {
+                                seq: sequence,
+                                sent: sent,
+                                bytes: bytes
+                        };
+
+                        pending_count++;
+                        transmitted++;
+
+                        in_flight = true;
+
+                        sequence++;
+
+                        next_send += flood_ns;
+
+                        now = now_ns();
+                }
+
+
+                /*
+                 * Re-check after TX.
+                 */
+
+                receive_flood_replies();
+                expire_flood_requests();
+
+
+                /*
+                 * Nothing left after Ctrl+C / -c.
+                 */
+
+                if (!running &&
+                    pending_count == 0)
+                        break;
+
+
+                /*
+                 * Find the next event:
+                 *
+                 *   - next scheduled transmission
+                 *   - earliest outstanding timeout
+                 *
+                 * socket.poll() uses milliseconds.
+                 * For sub-ms deadlines it receives 0 and
+                 * therefore returns immediately.
+                 */
+
+                now = now_ns();
+
+                let wait_ns = null;
+
+                if (running &&
+                    pending_count < 255) {
+
+                        let d =
+                                next_send - now;
+
+                        if (d < 0)
+                                d = 0;
+
+                        wait_ns = d;
+                }
+
+                for (let id = 1;
+                     id <= 255;
+                     id++) {
+
+                        let req =
+                                pending[id];
+
+                        if (req == null)
+                                continue;
+
+                        let d =
+                                (req.sent +
+                                 timeout_ns) -
+                                now;
+
+                        if (d < 0)
+                                d = 0;
+
+                        if (wait_ns == null ||
+                            d < wait_ns)
+                                wait_ns = d;
+                }
+
+                if (wait_ns == null)
+                        continue;
+
+                let wait_ms =
+                        int(
+                                wait_ns /
+                                1000000
+                        );
+
+                if (wait_ms < 0)
+                        wait_ms = 0;
+
+                socket.poll(
+                        wait_ms,
+                        sock
+                );
+        }
 }
 
 
