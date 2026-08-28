@@ -295,4 +295,4 @@ contains the peer's negotiated Magic-Number.
 
 ## License
 
-No license has been selected yet.
+This project is licensed under the GNU GPL v3 or later. See `LICENSE` for details.
