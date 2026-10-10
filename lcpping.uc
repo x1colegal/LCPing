@@ -899,7 +899,7 @@ if (flood_interval == null) {
  */
 
 else {
-        let pending = [];
+        let pending = {};
         let pending_count = 0;
 
         let flood_ns =
@@ -1009,7 +1009,7 @@ else {
                                 );
                         }
 
-                        pending[p.id] = null;
+                        delete pending[p.id];
                         pending_count--;
 
                         in_flight =
@@ -1025,9 +1025,7 @@ else {
         function expire_flood_requests() {
                 let now = now_ns();
 
-                for (let id = 1;
-                     id <= 255;
-                     id++) {
+                for (let id in pending) {
 
                         let req =
                                 pending[id];
@@ -1046,7 +1044,7 @@ else {
                                 );
                         }
 
-                        pending[id] = null;
+                        delete pending[id];
                         pending_count--;
                 }
 
@@ -1184,9 +1182,7 @@ else {
                         wait_ns = d;
                 }
 
-                for (let id = 1;
-                     id <= 255;
-                     id++) {
+                for (let id in pending) {
 
                         let req =
                                 pending[id];
