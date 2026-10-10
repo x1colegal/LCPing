@@ -236,7 +236,7 @@ line,
 if (!m)
 continue;
 
-let sid = int(m[1], 16);
+let sid = htons16(int(m[1], 16));
 let peer_mac = m[2];
 let dev = m[3];
 
